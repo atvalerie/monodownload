@@ -4,6 +4,8 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import readline from 'node:readline/promises';
+import { stdin as input, stdout as output } from 'node:process';
 import { fileURLToPath } from 'node:url';
 
 const ANSI = {
@@ -20,16 +22,16 @@ const ANSI = {
 };
 
 const DEFAULT_API_INSTANCES = [
-    'https://hifi.valerie.sh'
+    'https://ran412c.valerie.sh'
 ];
 
-const DEFAULT_POCKETBASE_URL = 'https://data.samidy.xyz';
 const DEFAULT_OUTPUT_ROOT = path.resolve(process.cwd(), 'downloads');
 const DEFAULT_QUALITY = 'HI_RES_LOSSLESS';
 const DEFAULT_DOWNLOAD_RETRIES = 2;
 const DEFAULT_FOLDER_TEMPLATE = '{albumTitle} - {albumArtist}';
 const DEFAULT_FILENAME_TEMPLATE = '{trackNumber} - {artist} - {title}';
 const CACHE_PATH = path.resolve(process.cwd(), '.cache', 'monochrome-playlist-downloader-cache.json');
+const AUTH_STORE_PATH = path.resolve(process.cwd(), '.cache', 'monochrome-instance-auth.json');
 const DEFAULT_INSTANCE_RATE_LIMIT_COOLDOWN_MS = 3 * 60 * 1000;
 const TIDAL_BROWSER_CLIENT_ID = 'txNoH4kkV41MfH25';
 const TIDAL_BROWSER_CLIENT_SECRET = 'dQjy0MinCEvxi1O4UmxvxWnDjt4cgHBPw8ll6nYBk98=';
@@ -51,8 +53,7 @@ async function main() {
     const input = path.resolve(args.input);
     const sourceValue = (await exists(input)) ? input : args.input;
     const outputRoot = path.resolve(args.output || DEFAULT_OUTPUT_ROOT);
-    const apiBase = args.apiUrl || process.env.MONOCHROME_API || null;
-    const pocketbaseUrl = args.pocketbaseUrl || process.env.MONOCHROME_POCKETBASE || DEFAULT_POCKETBASE_URL;
+    const apiBase = args['api-url'] || args.apiUrl || process.env.MONOCHROME_API || null;
     const quality = args.quality || DEFAULT_QUALITY;
     const includeLyrics = !args['no-lyrics'];
     const createZip = !args['no-zip'];
@@ -60,6 +61,10 @@ async function main() {
     const downloadRetries = parseNonNegativeInteger(args['download-retries'], DEFAULT_DOWNLOAD_RETRIES);
     const skipPlaybackPreflight = Boolean(args['i-know-it-doesnt-work-but-ill-use-it-anyway']);
     const cache = await PersistentCache.load(CACHE_PATH);
+    const authStore = await InstanceAuthStore.load(AUTH_STORE_PATH);
+    const authUsername = args['auth-username'] || process.env.MONOCHROME_AUTH_USERNAME || null;
+    const authLoginKey = args['auth-login-key'] || process.env.MONOCHROME_AUTH_LOGIN_KEY || null;
+    const authPassword = args['auth-password'] || process.env.MONOCHROME_AUTH_PASSWORD || null;
     let shuttingDown = false;
     let currentRunState = null;
     process.on('SIGINT', () => {
@@ -71,6 +76,7 @@ async function main() {
         console.log('\nSIGINT received, flushing cache...');
         Promise.all([
             cache.flush().catch(() => {}),
+            authStore.flush().catch(() => {}),
             currentRunState?.flush().catch(() => {}),
         ])
             .catch(() => {})
@@ -80,12 +86,16 @@ async function main() {
     const client = new MonochromeClient({
         apiBase,
         apiInstances: DEFAULT_API_INSTANCES,
-        pocketbaseUrl,
         quality,
         cache,
+        authStore,
+        authUsername,
+        authLoginKey,
+        authPassword,
     });
 
     console.log(`Cache file: ${CACHE_PATH}`);
+    console.log(`Auth store: ${AUTH_STORE_PATH}`);
     console.log(
         `Cache stats: search=${Object.keys(cache.data.searchTrack || {}).length}, metadata=${Object.keys(cache.data.trackMetadata || {}).length}, playlists=${Object.keys(cache.data.playlists || {}).length}, publicPlaylists=${Object.keys(cache.data.publicPlaylists || {}).length}, albums=${Object.keys(cache.data.albums || {}).length}, albumContents=${Object.keys(cache.data.albumContents || {}).length}, albumMergeQueues=${Object.keys(cache.data.albumMergeQueues || {}).length}, artists=${Object.keys(cache.data.artists || {}).length}, covers=${Object.keys(cache.data.covers || {}).length}`
     );
@@ -102,11 +112,7 @@ async function main() {
     let albumOnlyFolder = false;
 
     if (artistFolders && (source.type === 'album' || source.type === 'track')) {
-        const artistName = sanitizeForFilename(
-            source.metadata?.artist?.name ||
-            source.metadata?.artists?.[0]?.name ||
-            'Unknown Artist'
-        );
+        const artistName = sanitizeForFilename(getAlbumArtist(source.metadata) || 'Various Artists');
         const albumTitle = sanitizeForFilename(
             source.type === 'album' ? source.title : (source.metadata?.album?.title || source.title)
         );
@@ -221,9 +227,10 @@ async function main() {
 function installPrettyLogging() {
     const useColor = Boolean(process.stdout.isTTY) && !process.env.NO_COLOR;
     const rawArgv = process.argv.slice(2);
+    const helpRequested = rawArgv.includes('--help') || rawArgv.includes('-h') || rawArgv.includes('help');
     const forcePlain = rawArgv.includes('--plain') || rawArgv.includes('--no-ui');
     const verbose = rawArgv.includes('--verbose');
-    const useDashboard = Boolean(process.stdout.isTTY) && !forcePlain && !verbose;
+    const useDashboard = Boolean(process.stdout.isTTY) && !helpRequested && !forcePlain && !verbose;
     const original = {
         log: console.log.bind(console),
         warn: console.warn.bind(console),
@@ -337,6 +344,7 @@ class TtyDashboard {
         this.cooldowns = [];
         this.cooldownTimer = null;
         this.active = false;
+        this.suspended = false;
         this.state = {
             cacheFile: null,
             cacheStats: null,
@@ -372,6 +380,23 @@ class TtyDashboard {
         process.on('exit', () => {
             this.stop(false);
         });
+        this.render();
+    }
+
+    start() {
+        if (this.active || !this.output.isTTY) {
+            return;
+        }
+        this.active = true;
+        this.output.write('\x1b[?1049h');
+        this.output.write('\x1b[2J\x1b[H');
+        this.output.write('\x1b[?25l');
+        this.cooldownTimer = setInterval(() => {
+            if (this.active) {
+                this.render();
+            }
+        }, 1000);
+        this.cooldownTimer.unref?.();
         this.render();
     }
 
@@ -688,6 +713,22 @@ class TtyDashboard {
         this.output.write('\x1b[?1049l');
     }
 
+    suspendForPrompt() {
+        if (!this.output.isTTY) {
+            return;
+        }
+        this.suspended = true;
+        this.stop(false);
+    }
+
+    resumeAfterPrompt() {
+        if (!this.output.isTTY || !this.suspended) {
+            return;
+        }
+        this.suspended = false;
+        this.start();
+    }
+
     printFinalSummary() {
         this.stop(false);
         const lines = [];
@@ -764,11 +805,35 @@ function parseRetryAfterMs(value) {
     return null;
 }
 
+function normalizeApiBase(base) {
+    return String(base || '').trim().replace(/\/$/u, '');
+}
+
+function getManifestFormatsForQuality(quality) {
+    const normalized = String(quality || '').trim().toUpperCase();
+
+    switch (normalized) {
+        case 'LOW':
+            return ['HEAACV1', 'AACLC'];
+        case 'LOSSLESS':
+            return ['FLAC', 'AACLC', 'HEAACV1'];
+        case 'HI_RES_LOSSLESS':
+            return ['FLAC_HIRES', 'FLAC', 'AACLC', 'HEAACV1'];
+        default:
+            return ['FLAC_HIRES', 'FLAC', 'AACLC', 'HEAACV1'];
+    }
+}
+
 function parseArgs(argv) {
     const args = {};
 
     for (let i = 0; i < argv.length; i += 1) {
         const token = argv[i];
+
+        if (token === '-h' || token === 'help') {
+            args.help = true;
+            continue;
+        }
 
         if (!token.startsWith('--')) {
             if (!args.input) {
@@ -871,6 +936,66 @@ class PersistentCache {
     }
 }
 
+class InstanceAuthStore {
+    constructor(filePath, data) {
+        this.filePath = filePath;
+        this.data = data;
+    }
+
+    static async load(filePath) {
+        const defaults = {
+            instances: {},
+        };
+
+        try {
+            const raw = await fs.readFile(filePath, 'utf8');
+            const parsed = JSON.parse(raw);
+            return new InstanceAuthStore(filePath, {
+                ...defaults,
+                ...parsed,
+                instances: {
+                    ...defaults.instances,
+                    ...(parsed?.instances || {}),
+                },
+            });
+        } catch {
+            await fs.mkdir(path.dirname(filePath), { recursive: true }).catch(() => {});
+            return new InstanceAuthStore(filePath, defaults);
+        }
+    }
+
+    get(base) {
+        return this.data.instances[normalizeApiBase(base)] || null;
+    }
+
+    set(base, value) {
+        this.data.instances[normalizeApiBase(base)] = {
+            ...(value || {}),
+            updatedAt: new Date().toISOString(),
+        };
+    }
+
+    clearSession(base) {
+        const key = normalizeApiBase(base);
+        const current = this.data.instances[key];
+        if (!current) {
+            return;
+        }
+        delete current.sessionToken;
+        delete current.expiresAt;
+        current.updatedAt = new Date().toISOString();
+    }
+
+    async save() {
+        await fs.mkdir(path.dirname(this.filePath), { recursive: true });
+        await fs.writeFile(this.filePath, JSON.stringify(this.data, null, 2), 'utf8');
+    }
+
+    async flush() {
+        await this.save();
+    }
+}
+
 class RunState {
     constructor(rootDir, source, downloaded, failures) {
         this.rootDir = rootDir;
@@ -914,7 +1039,6 @@ Accepted input:
   - Spotify playlist/library CSV exports with track and artist columns
   - Generated Monochrome collection JSON files (.json)
   - Monochrome playlist links: /playlist/{id}
-  - Monochrome public user playlist links: /userplaylist/{id}
   - Monochrome album links: /album/{id}
   - Monochrome track links: /track/{id}
   - Monochrome artist links: /artist/{id}
@@ -923,8 +1047,10 @@ Options:
   --input <value>          CSV/JSON path or Monochrome link
   --output <dir>           Output directory root. Default: ./downloads
   --api-url <url>          Override Monochrome/HiFi API base URL
-  --pocketbase-url <url>   Override PocketBase URL for public user playlists
   --quality <token>        Default: HI_RES_LOSSLESS
+  --auth-username <value>  Username for auth-enabled instances
+  --auth-login-key <value> Login key for auth-enabled instances
+  --auth-password <value>  Password for legacy Basic-auth instances
   --download-retries <n>   Retry transient track download failures this many times. Default: 2
   --no-lyrics              Skip .lrc lyric downloads
   --no-zip                 Skip ZIP archive creation
@@ -934,7 +1060,11 @@ Options:
   --verbose                Show raw request/resolver logs instead of the TTY dashboard
   --i-know-it-doesnt-work-but-ill-use-it-anyway
                            Skip the startup playback preflight
-  --help                   Show this help
+  --help, -h, help         Show this help
+
+If an instance requires auth and no saved credentials are available, the CLI
+will prompt for either legacy Basic auth or the newer login/redeem flow,
+depending on what the instance root advertises.
 `.trim());
 }
 
@@ -982,14 +1112,7 @@ async function resolveSource(input, client, options = {}) {
     const userPlaylistMatch = input.match(/\/userplaylist\/([^/?#]+)/i);
     if (userPlaylistMatch) {
         const playlistId = userPlaylistMatch[1];
-        const playlist = await client.getPublicPlaylist(playlistId);
-        return {
-            type: 'user-playlist',
-            title: playlist.title,
-            tracks: playlist.tracks,
-            missing: [],
-            metadata: playlist,
-        };
+        throw new Error('Public user playlist links are no longer supported because the PocketBase backend is being shut down.');
     }
 
     const albumMatch = input.match(/\/album\/([^/?#]+)/i);
@@ -1492,12 +1615,16 @@ function selectPreflightTracks(tracks, limit) {
 function isLikelyPlaybackAuthFailure(message) {
     const value = String(message || '').toLowerCase();
     return (
+        value.includes('401 unauthorized') ||
         value.includes('403 forbidden') ||
+        value.includes('authentication required for') ||
+        value.includes('missing or invalid authorization header') ||
+        value.includes('invalid or expired token') ||
         value.includes('preview dash manifest detected') ||
         value.includes('full_requires_subscription') ||
         value.includes('presentation=preview') ||
         value.includes('preview-only') ||
-        value.includes('could not resolve stream from /track or /trackmanifests')
+        value.includes('could not resolve stream from trackmanifests')
     );
 }
 
@@ -1586,24 +1713,33 @@ function getTrackTitle(track) {
 
 async function downloadTrack({ track, assemblyRoot, client, includeLyrics, albumCoverWrites, flatAlbumDir = false, albumOnlyFolder = false }) {
     const hydratedTrack = await client.getTrackMetadata(track.id).catch(() => track);
-    const resolvedTrack = mergeTrackMetadata(track, hydratedTrack);
+    const mergedTrack = mergeTrackMetadata(track, hydratedTrack);
+    const resolvedTrack = await hydrateTrackAlbumMetadata(mergedTrack, client).catch(() => mergedTrack);
     const fileBase = formatTemplate(DEFAULT_FILENAME_TEMPLATE, {
         trackNumber: resolvedTrack.trackNumber,
         artist: resolvedTrack.artist?.name || resolvedTrack.artists?.[0]?.name,
         title: getTrackTitle(resolvedTrack),
     });
+    const discNumber = Number(resolvedTrack.volumeNumber || resolvedTrack.discNumber || 1);
+    const totalDiscs = Number(resolvedTrack.album?.totalDiscs || resolvedTrack.album?.numberOfVolumes || 1);
 
     let albumDir;
     let relativeAudioPath;
     if (flatAlbumDir) {
-        albumDir = assemblyRoot;
-        relativeAudioPath = `${fileBase}.flac`;
+        if (totalDiscs > 1) {
+            const discDir = await resolvePreferredDirectory(assemblyRoot, `Disc ${discNumber}`);
+            albumDir = discDir;
+            relativeAudioPath = path.posix.join(path.basename(discDir), `${fileBase}.flac`);
+        } else {
+            albumDir = assemblyRoot;
+            relativeAudioPath = `${fileBase}.flac`;
+        }
     } else {
         const folderName = albumOnlyFolder
             ? sanitizeForFilename(resolvedTrack.album?.title || 'Unknown Album')
             : formatTemplate(DEFAULT_FOLDER_TEMPLATE, {
                   albumTitle: resolvedTrack.album?.title,
-                  albumArtist: resolvedTrack.album?.artist?.name || resolvedTrack.artist?.name,
+                  albumArtist: getAlbumArtist(resolvedTrack) || 'Various Artists',
               });
         albumDir = await resolvePreferredDirectory(assemblyRoot, folderName);
         const actualFolderName = path.basename(albumDir);
@@ -1615,7 +1751,7 @@ async function downloadTrack({ track, assemblyRoot, client, includeLyrics, album
     const existingAudioPath = await findExistingAudioPath(absoluteAudioPath);
     if (existingAudioPath) {
         const finalRelativeAudioPath = flatAlbumDir
-            ? path.basename(existingAudioPath)
+            ? path.relative(assemblyRoot, existingAudioPath).split(path.sep).join(path.posix.sep)
             : path.posix.join(path.basename(albumDir), path.basename(existingAudioPath));
         console.log(`  -> file exists, skipping download: ${finalRelativeAudioPath}`);
         return {
@@ -1626,7 +1762,7 @@ async function downloadTrack({ track, assemblyRoot, client, includeLyrics, album
 
     const audioResult = await client.downloadTrackToFile(resolvedTrack.id, absoluteAudioPath);
     const finalRelativeAudioPath = flatAlbumDir
-        ? `${fileBase}.${audioResult.extension}`
+        ? relativeAudioPath.replace(/\.flac$/i, `.${audioResult.extension}`)
         : path.posix.join(path.basename(albumDir), `${fileBase}.${audioResult.extension}`);
     let finalAbsoluteAudioPath = absoluteAudioPath;
 
@@ -1692,6 +1828,26 @@ function getTrackArtists(track) {
     return getPrimaryTrackArtist(track);
 }
 
+function getAlbumArtist(track) {
+    if (track?.album?.artist?.name) {
+        return track.album.artist.name;
+    }
+
+    if (Array.isArray(track?.album?.artists)) {
+        const firstNamedArtist = track.album.artists.find((artist) => artist?.name);
+        if (firstNamedArtist?.name) {
+            return firstNamedArtist.name;
+        }
+    }
+
+    const primaryTrackArtist = getPrimaryTrackArtist(track);
+    if (primaryTrackArtist && primaryTrackArtist !== 'Unknown Artist') {
+        return primaryTrackArtist;
+    }
+
+    return 'Unknown Artist';
+}
+
 function isRetryableDownloadError(message) {
     const value = String(message || '').toLowerCase();
     return (
@@ -1719,6 +1875,31 @@ function mergeTrackMetadata(primary, fallback) {
         },
         artist: primary?.artist || fallback?.artist,
         artists: primary?.artists || fallback?.artists,
+    };
+}
+
+async function hydrateTrackAlbumMetadata(track, client) {
+    const albumId = normalizeId(track?.album?.id || track?.albumId);
+    if (!albumId) {
+        return track;
+    }
+
+    const albumPayload = await client.getAlbum(albumId).catch(() => null);
+    const album = albumPayload?.album || null;
+    if (!album) {
+        return track;
+    }
+
+    return {
+        ...track,
+        album: {
+            ...(track?.album || {}),
+            ...album,
+            artist: album?.artist || track?.album?.artist || null,
+            artists: album?.artists || track?.album?.artists || [],
+            totalDiscs: album?.totalDiscs ?? album?.numberOfVolumes ?? track?.album?.totalDiscs ?? null,
+            numberOfTracks: album?.numberOfTracks ?? track?.album?.numberOfTracks ?? null,
+        },
     };
 }
 
@@ -2085,16 +2266,20 @@ async function embedMetadataWithFfmpeg({ audioPath, track, lyrics, coverBuffer }
 
 function buildMetadataArgs(track, lyrics) {
     const metadata = new Map();
-    // HiFi /info can return an album artist that does not match what TIDAL presents.
-    // For tags, use the primary track artist instead of the joined credits list or bad album artist.
-    const albumArtist = getPrimaryTrackArtist(track);
+    const albumArtist = getAlbumArtist(track);
+    const trackArtists = getTrackArtists(track);
+    const trackNumber = formatNumberPair(track?.trackNumber, track?.album?.numberOfTracksOnDisc || track?.album?.numberOfTracks);
+    const discNumber = formatNumberPair(track?.volumeNumber || track?.discNumber, track?.album?.totalDiscs);
 
     metadata.set('title', getTrackTitle(track));
-    metadata.set('artist', getTrackArtists(track));
+    metadata.set('artist', trackArtists);
     metadata.set('album', track?.album?.title || '');
     metadata.set('album_artist', albumArtist || '');
-    metadata.set('track', formatNumberPair(track?.trackNumber, track?.album?.numberOfTracksOnDisc || track?.album?.numberOfTracks));
-    metadata.set('disc', formatNumberPair(track?.volumeNumber || track?.discNumber, track?.album?.totalDiscs));
+    metadata.set('albumartist', albumArtist || '');
+    metadata.set('track', trackNumber);
+    metadata.set('tracknumber', trackNumber);
+    metadata.set('disc', discNumber);
+    metadata.set('discnumber', discNumber);
     metadata.set('date', normalizeReleaseDate(track?.album?.releaseDate || track?.streamStartDate));
     metadata.set('isrc', track?.isrc || '');
     metadata.set('copyright', track?.copyright || '');
@@ -2476,14 +2661,20 @@ async function resolvePreferredDirectory(parentDir, preferredName) {
 }
 
 class MonochromeClient {
-    constructor({ apiBase, apiInstances, pocketbaseUrl, quality, cache }) {
+    constructor({ apiBase, apiInstances, quality, cache, authStore, authUsername, authLoginKey, authPassword }) {
         this.apiBase = apiBase;
         this.apiInstances = apiInstances;
-        this.pocketbaseUrl = pocketbaseUrl;
         this.quality = quality;
         this.cache = cache;
+        this.authStore = authStore;
+        this.authUsername = authUsername;
+        this.authLoginKey = authLoginKey;
+        this.authPassword = authPassword;
         this.instanceCooldownMs = Number(process.env.MONOCHROME_INSTANCE_COOLDOWN_MS || DEFAULT_INSTANCE_RATE_LIMIT_COOLDOWN_MS);
         this.instanceEndpointCooldowns = new Map();
+        this.instanceAuthRequirements = new Map();
+        this.instanceValidatedTokens = new Map();
+        this.instanceProfiles = new Map();
         this.tidalToken = null;
         this.tidalTokenExpiry = 0;
     }
@@ -2498,17 +2689,7 @@ class MonochromeClient {
             for (const base of instances) {
                 const url = `${base.replace(/\/$/u, '')}${relativePath}`;
                 try {
-                    console.log(`[request:${type}] ${url}`);
-                    const response = await fetch(url);
-                    if (!response.ok) {
-                        console.log(`[request:${type}] ${response.status} ${response.statusText}`);
-                        this.noteEndpointResponse(base, endpointKey, response.status, response.headers);
-                        lastError = new Error(`${response.status} ${response.statusText} for ${url}`);
-                        continue;
-                    }
-                    this.noteEndpointResponse(base, endpointKey, response.status, response.headers);
-                    console.log(`[request:${type}] ok`);
-                    return raw ? response : await response.json();
+                    return await this.requestAgainstBase(base, relativePath, { type, raw });
                 } catch (error) {
                     console.log(`[request:${type}] failed: ${error instanceof Error ? error.message : String(error)}`);
                     lastError = error;
@@ -2601,44 +2782,6 @@ class MonochromeClient {
         const tracks = (items || []).map((entry) => entry.item || entry);
         const result = { playlist, tracks };
         this.cache.set('playlists', String(id), result);
-        return result;
-    }
-
-    async getPublicPlaylist(uuid) {
-        const cached = this.cache.get('publicPlaylists', String(uuid));
-        if (cached) {
-            console.log(`Public playlist cache hit: ${uuid}`);
-            return cached;
-        }
-
-        const filter = encodeURIComponent(`uuid="${uuid}"`);
-        const url = `${this.pocketbaseUrl.replace(/\/$/u, '')}/api/collections/public_playlists/records?filter=${filter}&perPage=1`;
-        console.log(`[request:pocketbase] ${url}`);
-        const response = await fetch(url);
-        if (!response.ok) {
-            throw new Error(`Failed to fetch PocketBase playlist ${uuid}: ${response.status}`);
-        }
-
-        const payload = await response.json();
-        const record = payload.items?.[0];
-        if (!record) {
-            throw new Error(`Public playlist ${uuid} not found`);
-        }
-
-        const data = safeJson(record.data, {});
-        const tracks = safeJson(record.tracks, []);
-        const title = record.title || record.name || record.playlist_name || data.title || data.name || uuid;
-
-        const result = {
-            ...record,
-            id: uuid,
-            uuid,
-            title,
-            name: title,
-            artist: 'Community Playlist',
-            tracks,
-        };
-        this.cache.set('publicPlaylists', String(uuid), result);
         return result;
     }
 
@@ -2750,14 +2893,6 @@ class MonochromeClient {
     async resolveTrackStream(trackId) {
         const diagnostics = [];
 
-        const byTrack = await this.tryTrackEndpointAcrossInstances(trackId).catch((error) => {
-            diagnostics.push(error instanceof Error ? error.message : String(error));
-            return null;
-        });
-        if (byTrack) {
-            return byTrack;
-        }
-
         const byManifest = await this.tryTrackManifestEndpointAcrossInstances(trackId).catch((error) => {
             diagnostics.push(error instanceof Error ? error.message : String(error));
             return null;
@@ -2782,7 +2917,7 @@ class MonochromeClient {
         }
 
         throw new Error(
-            `Could not resolve stream from /track or /trackManifests${diagnostics.length ? `: ${diagnostics.join(' | ')}` : ''}`
+            `Could not resolve stream from trackManifests${diagnostics.length ? `: ${diagnostics.join(' | ')}` : ''}`
         );
     }
 
@@ -2856,55 +2991,6 @@ class MonochromeClient {
         }
     }
 
-    async tryTrackEndpointAcrossInstances(trackId) {
-        const bases = await this.getApiBasesForEndpoint('/track');
-        let lastError = null;
-
-        for (const base of bases) {
-            console.log(`  -> stream source: /track endpoint (${base})`);
-            try {
-                const lookupPayload = await this.requestAgainstBase(
-                    base,
-                    `/track/?id=${encodeURIComponent(trackId)}&quality=${encodeURIComponent(this.quality)}`
-                );
-                const normalized = this.normalizeTrackLookup(lookupPayload);
-
-                if (normalized.originalTrackUrl) {
-                    console.log('  -> stream source: OriginalTrackUrl');
-                    const stream = await this.downloadFromResolvedUri(normalized.originalTrackUrl);
-                    if (await this.isAcceptableResolvedStream(stream)) {
-                        return stream;
-                    }
-                    console.log('  -> stream rejected, trying next instance');
-                    continue;
-                }
-
-                if (normalized.manifest) {
-                    const manifestResult = this.extractFromManifest(normalized.manifest);
-                    console.log('  -> stream source: decoded /track manifest');
-                    const stream = await this.downloadFromResolvedUri(manifestResult);
-                    if (await this.isAcceptableResolvedStream(stream)) {
-                        return stream;
-                    }
-                    console.log('  -> stream rejected, trying next instance');
-                    continue;
-                }
-
-                throw new Error('No usable stream in /track response');
-            } catch (error) {
-                lastError = error;
-                console.log(`  -> /track failed on ${base}: ${error instanceof Error ? error.message : String(error)}`);
-            }
-        }
-
-        if (lastError) {
-            console.log(
-                `  -> /track path unavailable, falling back to trackManifests: ${lastError instanceof Error ? lastError.message : String(lastError)}`
-            );
-        }
-        return null;
-    }
-
     async fetchDirectTidalToken(force = false) {
         if (!force && this.tidalToken && Date.now() < this.tidalTokenExpiry) {
             return this.tidalToken;
@@ -2948,10 +3034,9 @@ class MonochromeClient {
         params.append('manifestType', 'MPEG_DASH');
         params.append('uriScheme', 'HTTPS');
         params.append('usage', 'PLAYBACK');
-        params.append('formats', 'HEAACV1');
-        params.append('formats', 'AACLC');
-        params.append('formats', 'FLAC_HIRES');
-        params.append('formats', 'FLAC');
+        for (const format of getManifestFormatsForQuality(this.quality)) {
+            params.append('formats', format);
+        }
 
         const url = `https://openapi.tidal.com/v2/trackManifests/${encodeURIComponent(trackId)}?${params.toString()}`;
         let token = await this.fetchDirectTidalToken(false);
@@ -3000,8 +3085,9 @@ class MonochromeClient {
 
     async tryTrackManifestEndpoint(trackId) {
         const params = new URLSearchParams();
-        params.append('formats', 'FLAC_HIRES');
-        params.append('formats', 'FLAC');
+        for (const format of getManifestFormatsForQuality(this.quality)) {
+            params.append('formats', format);
+        }
         params.append('adaptive', 'true');
         params.append('manifestType', 'MPEG_DASH');
         params.append('uriScheme', 'HTTPS');
@@ -3020,8 +3106,9 @@ class MonochromeClient {
         for (const base of bases) {
             try {
                 const params = new URLSearchParams();
-                params.append('formats', 'FLAC_HIRES');
-                params.append('formats', 'FLAC');
+                for (const format of getManifestFormatsForQuality(this.quality)) {
+                    params.append('formats', format);
+                }
                 params.append('adaptive', 'true');
                 params.append('manifestType', 'MPEG_DASH');
                 params.append('uriScheme', 'HTTPS');
@@ -3070,19 +3157,37 @@ class MonochromeClient {
         throw new Error('trackManifests path unavailable');
     }
 
-    async requestAgainstBase(base, relativePath) {
+    async requestAgainstBase(base, relativePath, { type = 'api', raw = false } = {}) {
         const endpointKey = this.getEndpointKey(relativePath);
-        const url = `${String(base).replace(/\/$/u, '')}${relativePath}`;
-        console.log(`[request:api] ${url}`);
-        const response = await fetch(url);
-        if (!response.ok) {
-            console.log(`[request:api] ${response.status} ${response.statusText}`);
-            this.noteEndpointResponse(base, endpointKey, response.status, response.headers);
-            throw new Error(`${response.status} ${response.statusText} for ${url}`);
+        const normalizedBase = normalizeApiBase(base);
+        const resolvedPath = await this.resolveRelativePathForBase(normalizedBase, relativePath);
+        const url = `${normalizedBase}${resolvedPath}`;
+
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+            console.log(`[request:${type}] ${url}`);
+            const headers = await this.getRequestHeaders(normalizedBase, { forceRefresh: attempt > 0 });
+            const response = await fetch(url, {
+                headers,
+            });
+
+            if (response.status === 401 && attempt === 0) {
+                this.instanceAuthRequirements.set(normalizedBase, true);
+                this.clearStoredSession(normalizedBase);
+                continue;
+            }
+
+            if (!response.ok) {
+                console.log(`[request:${type}] ${response.status} ${response.statusText}`);
+                this.noteEndpointResponse(normalizedBase, endpointKey, response.status, response.headers);
+                throw new Error(`${response.status} ${response.statusText} for ${url}`);
+            }
+
+            this.noteEndpointResponse(normalizedBase, endpointKey, response.status, response.headers);
+            console.log(`[request:${type}] ok`);
+            return raw ? response : await response.json();
         }
-        this.noteEndpointResponse(base, endpointKey, response.status, response.headers);
-        console.log('[request:api] ok');
-        return await response.json();
+
+        throw new Error(`401 Unauthorized for ${url}`);
     }
 
     async isAcceptableResolvedStream(stream) {
@@ -3102,81 +3207,297 @@ class MonochromeClient {
         return false;
     }
 
-    normalizeTrackLookup(response) {
-        const unwrapped = response?.data ?? response;
-        const entries = Array.isArray(unwrapped) ? unwrapped : [unwrapped, response].filter(Boolean);
-        let info = null;
-        let originalTrackUrl = null;
-
-        for (const entry of entries) {
-            if (!entry || typeof entry !== 'object') {
-                continue;
-            }
-            if (!info && entry.manifest) {
-                info = entry;
-            }
-            if (!originalTrackUrl && typeof entry.OriginalTrackUrl === 'string') {
-                originalTrackUrl = entry.OriginalTrackUrl;
-            }
-            if (!originalTrackUrl && typeof entry.originalTrackUrl === 'string') {
-                originalTrackUrl = entry.originalTrackUrl;
-            }
-            if (!originalTrackUrl && typeof entry.url === 'string' && !entry.manifest) {
-                originalTrackUrl = entry.url;
-            }
+    async getRequestHeaders(base, { forceRefresh = false } = {}) {
+        const auth = await this.getAuthorization(base, { forceRefresh });
+        if (!auth) {
+            return {};
         }
-
-        if (!info && response?.info?.manifest) {
-            info = response.info;
-        }
-
-        if (!info) {
-            throw new Error('Malformed track lookup payload');
-        }
-
         return {
-            manifest: info.manifest,
-            originalTrackUrl,
+            authorization: auth,
         };
     }
 
-    extractFromManifest(manifest) {
-        if (!manifest) {
-            throw new Error('Missing track manifest');
+    async getAuthorization(base, { forceRefresh = false } = {}) {
+        const normalizedBase = normalizeApiBase(base);
+        const profile = await this.getInstanceProfile(normalizedBase);
+        const authRequired = profile.authRequired;
+        if (!authRequired) {
+            return null;
         }
 
-        let decoded = manifest;
-        if (typeof manifest === 'string') {
-            try {
-                decoded = Buffer.from(manifest, 'base64').toString('utf8');
-            } catch {
-                decoded = manifest;
+        if (profile.authMode === 'basic') {
+            const credentials = await this.resolveCredentials(normalizedBase, profile);
+            if (!credentials?.username || !credentials?.password) {
+                throw new Error(
+                    `Legacy Basic auth required for ${normalizedBase}. Provide --auth-username and --auth-password, set MONOCHROME_AUTH_USERNAME and MONOCHROME_AUTH_PASSWORD, or run once in an interactive terminal to save credentials.`
+                );
             }
+            this.authStore?.set(normalizedBase, {
+                ...this.authStore?.get(normalizedBase),
+                username: credentials.username,
+                password: credentials.password,
+                authType: 'basic',
+            });
+            this.authStore?.save().catch(() => {});
+            return `Basic ${Buffer.from(`${credentials.username}:${credentials.password}`).toString('base64')}`;
         }
 
-        if (typeof decoded === 'object' && Array.isArray(decoded.urls) && decoded.urls.length > 0) {
-            return decoded.urls[0];
-        }
-
-        if (typeof decoded === 'string' && decoded.includes('<MPD')) {
-            return { kind: 'mpd-text', text: decoded };
-        }
-
-        if (typeof decoded === 'string') {
-            try {
-                const parsed = JSON.parse(decoded);
-                if (Array.isArray(parsed.urls) && parsed.urls.length > 0) {
-                    return parsed.urls[0];
-                }
-            } catch {
-                const match = decoded.match(/https?:\/\/[^\s"'<>]+/u);
-                if (match) {
-                    return match[0];
-                }
+        const stored = this.authStore?.get(normalizedBase) || null;
+        if (!forceRefresh && stored?.sessionToken && !this.isSessionExpired(stored)) {
+            const validatedToken = this.instanceValidatedTokens.get(normalizedBase);
+            if (validatedToken === stored.sessionToken) {
+                return `Bearer ${stored.sessionToken}`;
             }
+            const valid = await this.validateSession(normalizedBase, stored.sessionToken);
+            if (valid) {
+                this.instanceValidatedTokens.set(normalizedBase, stored.sessionToken);
+                return `Bearer ${stored.sessionToken}`;
+            }
+            this.clearStoredSession(normalizedBase);
         }
 
-        throw new Error('Could not resolve a stream URL from the track manifest');
+        const credentials = await this.resolveCredentials(normalizedBase, profile);
+        if (!credentials) {
+            throw new Error(
+                `Authentication required for ${normalizedBase}. Provide --auth-username and --auth-login-key, set MONOCHROME_AUTH_USERNAME and MONOCHROME_AUTH_LOGIN_KEY, or run once in an interactive terminal to save credentials.`
+            );
+        }
+
+        const sessionToken = await this.loginAgainstBase(normalizedBase, credentials);
+        return `Bearer ${sessionToken}`;
+    }
+
+    async isAuthRequired(base) {
+        const profile = await this.getInstanceProfile(base);
+        return profile.authRequired;
+    }
+
+    async validateSession(base, sessionToken) {
+        try {
+            const response = await fetch(`${normalizeApiBase(base)}/auth/me`, {
+                headers: {
+                    authorization: `Bearer ${sessionToken}`,
+                },
+            });
+            return response.ok;
+        } catch {
+            return false;
+        }
+    }
+
+    isSessionExpired(record) {
+        const expiresAt = Date.parse(record?.expiresAt || '');
+        if (!Number.isFinite(expiresAt)) {
+            return false;
+        }
+        return expiresAt <= Date.now() + 60 * 1000;
+    }
+
+    clearStoredSession(base) {
+        const normalizedBase = normalizeApiBase(base);
+        this.instanceValidatedTokens.delete(normalizedBase);
+        this.authStore?.clearSession(normalizedBase);
+        this.authStore?.save().catch(() => {});
+    }
+
+    async getInstanceProfile(base) {
+        const normalizedBase = normalizeApiBase(base);
+        if (this.instanceProfiles.has(normalizedBase)) {
+            return this.instanceProfiles.get(normalizedBase);
+        }
+
+        let payload = null;
+        try {
+            const response = await fetch(`${normalizedBase}/`);
+            if (response.ok) {
+                payload = await response.json().catch(() => null);
+            }
+        } catch {}
+
+        const pyEnabled = Boolean(payload?.py?.enabled);
+        const authRequired = Boolean(payload?.auth?.required);
+        const authMode = authRequired ? (pyEnabled ? 'bearer' : 'basic') : 'none';
+        const profile = {
+            pyEnabled,
+            authRequired,
+            authMode,
+            payload,
+        };
+
+        this.instanceProfiles.set(normalizedBase, profile);
+        this.instanceAuthRequirements.set(normalizedBase, authRequired);
+        if (pyEnabled) {
+            console.log(`  -> compatibility mode: /py enabled on ${normalizedBase}`);
+        }
+        if (authRequired) {
+            console.log(`  -> auth required: ${normalizedBase} (${authMode})`);
+        }
+        return profile;
+    }
+
+    async resolveRelativePathForBase(base, relativePath) {
+        const normalizedBase = normalizeApiBase(base);
+        const profile = await this.getInstanceProfile(normalizedBase);
+        if (!profile.pyEnabled) {
+            return relativePath;
+        }
+        return relativePath.startsWith('/py/') ? relativePath : `/py${relativePath}`;
+    }
+
+    async resolveCredentials(base, profile = null) {
+        const normalizedBase = normalizeApiBase(base);
+        const resolvedProfile = profile || (await this.getInstanceProfile(normalizedBase));
+        const stored = this.authStore?.get(normalizedBase) || null;
+        const username = this.authUsername || stored?.username || null;
+        const loginKey = this.authLoginKey || stored?.loginKey || null;
+        const password = this.authPassword || stored?.password || null;
+
+        if (resolvedProfile.authMode === 'basic' && username && password) {
+            return { username, password };
+        }
+
+        if (resolvedProfile.authMode !== 'basic' && username && loginKey) {
+            return { username, loginKey };
+        }
+
+        if (!process.stdin.isTTY || !process.stdout.isTTY) {
+            return null;
+        }
+
+        const dashboard = globalThis.__MONOCHROME_DASHBOARD__;
+        dashboard?.suspendForPrompt?.();
+        const rl = readline.createInterface({ input, output });
+        try {
+            console.log(`Authentication required for ${normalizedBase}`);
+            if (resolvedProfile.authMode === 'basic') {
+                const promptedUsername = String(await rl.question('Username: ')).trim();
+                const promptedPassword = String(await rl.question('Password: ')).trim();
+                if (!promptedUsername || !promptedPassword) {
+                    return null;
+                }
+                return {
+                    username: promptedUsername,
+                    password: promptedPassword,
+                };
+            }
+            const authMode = String(await rl.question('Choose auth mode ([l]ogin / [r]edeem invite): ')).trim().toLowerCase();
+
+            if (authMode.startsWith('r')) {
+                const inviteCode = String(await rl.question('Invite code: ')).trim();
+                const inviteUsername = String(await rl.question('Username: ')).trim();
+                if (!inviteCode || !inviteUsername) {
+                    return null;
+                }
+                return await this.redeemInviteAgainstBase(normalizedBase, {
+                    inviteCode,
+                    username: inviteUsername,
+                });
+            }
+
+            const promptedUsername = String(await rl.question('Username: ')).trim();
+            const promptedLoginKey = String(await rl.question('Login key: ')).trim();
+            if (!promptedUsername || !promptedLoginKey) {
+                return null;
+            }
+            return {
+                username: promptedUsername,
+                loginKey: promptedLoginKey,
+            };
+        } finally {
+            rl.close();
+            dashboard?.resumeAfterPrompt?.();
+        }
+    }
+
+    async loginAgainstBase(base, credentials) {
+        const normalizedBase = normalizeApiBase(base);
+        console.log(`  -> logging in: ${normalizedBase} (${credentials.username})`);
+        const response = await fetch(`${normalizedBase}/auth/login`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                username: credentials.username,
+                loginKey: credentials.loginKey,
+            }),
+        });
+
+        if (!response.ok) {
+            let detail = `${response.status} ${response.statusText}`;
+            try {
+                const payload = await response.json();
+                if (payload?.detail) {
+                    detail = `${detail} - ${payload.detail}`;
+                }
+            } catch {}
+            throw new Error(`Authentication failed for ${normalizedBase}: ${detail}`);
+        }
+
+        const payload = await response.json();
+        const sessionToken = payload?.sessionToken;
+        const expiresAt = payload?.expiresAt || null;
+        if (!sessionToken) {
+            throw new Error(`Authentication failed for ${normalizedBase}: missing session token`);
+        }
+
+        this.authStore?.set(normalizedBase, {
+            username: credentials.username,
+            loginKey: credentials.loginKey,
+            sessionToken,
+            expiresAt,
+        });
+        await this.authStore?.save();
+        this.instanceValidatedTokens.set(normalizedBase, sessionToken);
+        return sessionToken;
+    }
+
+    async redeemInviteAgainstBase(base, invite) {
+        const normalizedBase = normalizeApiBase(base);
+        console.log(`  -> redeeming invite: ${normalizedBase} (${invite.username})`);
+        const response = await fetch(`${normalizedBase}/auth/redeem`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                inviteCode: invite.inviteCode,
+                username: invite.username,
+            }),
+        });
+
+        if (!response.ok) {
+            let detail = `${response.status} ${response.statusText}`;
+            try {
+                const payload = await response.json();
+                if (payload?.detail) {
+                    detail = `${detail} - ${payload.detail}`;
+                }
+            } catch {}
+            throw new Error(`Invite redemption failed for ${normalizedBase}: ${detail}`);
+        }
+
+        const payload = await response.json();
+        const sessionToken = payload?.sessionToken;
+        const loginKey = payload?.loginKey;
+        const username = payload?.user?.username || invite.username;
+        const expiresAt = payload?.expiresAt || null;
+        if (!sessionToken || !loginKey || !username) {
+            throw new Error(`Invite redemption failed for ${normalizedBase}: incomplete response`);
+        }
+
+        this.authStore?.set(normalizedBase, {
+            username,
+            loginKey,
+            sessionToken,
+            expiresAt,
+        });
+        await this.authStore?.save();
+        this.instanceValidatedTokens.set(normalizedBase, sessionToken);
+        return {
+            username,
+            loginKey,
+        };
     }
 
     async downloadFromResolvedUri(uri) {
@@ -3672,13 +3993,19 @@ async function streamToBuffer(result) {
 installPrettyLogging();
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
+    const rawArgv = process.argv.slice(2);
+    const helpRequested = rawArgv.includes('--help') || rawArgv.includes('-h') || rawArgv.includes('help');
     main()
         .then(() => {
-            globalThis.__MONOCHROME_DASHBOARD__?.printFinalSummary?.();
+            if (!helpRequested) {
+                globalThis.__MONOCHROME_DASHBOARD__?.printFinalSummary?.();
+            }
         })
         .catch((error) => {
             globalThis.__MONOCHROME_DASHBOARD__?.handleLine('error', error instanceof Error ? error.message : String(error));
-            globalThis.__MONOCHROME_DASHBOARD__?.printFinalSummary?.();
+            if (!helpRequested) {
+                globalThis.__MONOCHROME_DASHBOARD__?.printFinalSummary?.();
+            }
             console.error(error instanceof Error ? error.message : error);
             process.exit(1);
         });
