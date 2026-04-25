@@ -3,6 +3,7 @@
 Standalone CLI project for downloading tracks from:
 
 - Spotify-style CSV exports
+- Plain text files with one supported link per line
 - Generated Monochrome collection JSON files
 - Monochrome playlist links
 - Monochrome album links
@@ -40,7 +41,7 @@ node .\index.mjs --input "C:\Users\v\Downloads\liked.csv" --output "C:\Users\v\M
 ## Options
 
 ```text
---input <value>          CSV/JSON path or Monochrome album/track/artist/playlist link
+--input <value>          CSV/TXT/JSON path or Monochrome album/track/artist/playlist link
 --output <dir>           Output directory root. Default: ./downloads
 --api-url <url>          Override the primary API base URL
 --quality <token>        Default: HI_RES_LOSSLESS
@@ -67,6 +68,7 @@ node .\index.mjs --input "C:\Users\v\Downloads\liked.csv" --output "C:\Users\v\M
 - You can preseed new-session auth with `--auth-username` and `--auth-login-key` or `MONOCHROME_AUTH_USERNAME` and `MONOCHROME_AUTH_LOGIN_KEY`
 - You can preseed legacy Basic auth with `--auth-username` and `--auth-password` or `MONOCHROME_AUTH_USERNAME` and `MONOCHROME_AUTH_PASSWORD`
 - In an interactive terminal, the CLI inspects `/` on the target instance and prompts for either legacy Basic auth or the newer login/redeem flow
+- `.txt` inputs may contain one supported link per line; blank lines and lines starting with `#` are ignored
 - Output artifacts are written into the playlist folder, including `_run-state.json`
 - A live TTY dashboard is used by default for interactive terminals; use `--plain` or `--verbose` to fall back to line-by-line logs
 - Passing a generated `.json` collection file expands each playlist track to its full album and downloads only the album tracks that were not already in the playlist, so the result can be merged back in later

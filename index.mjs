@@ -1040,6 +1040,7 @@ Usage:
 
 Accepted input:
   - Spotify playlist/library CSV exports with track and artist columns
+  - Plain text files (.txt) with one supported link per line
   - Generated Monochrome collection JSON files (.json)
   - Monochrome playlist links: /playlist/{id}
   - Monochrome album links: /album/{id}
@@ -1047,7 +1048,7 @@ Accepted input:
   - Monochrome artist links: /artist/{id}
 
 Options:
-  --input <value>          CSV/JSON path or Monochrome link
+  --input <value>          CSV/JSON/TXT path or Monochrome link
   --output <dir>           Output directory root. Default: ./downloads
   --api-url <url>          Override Monochrome/HiFi API base URL
   --quality <token>        Default: HI_RES_LOSSLESS
@@ -1096,7 +1097,13 @@ async function resolveSource(input, client, options = {}) {
             return await parseJsonSource(jsonText, input, client, options);
         }
 
-        throw new Error('Only CSV and supported JSON files are supported for file input.');
+        if (extension === '.txt') {
+            console.log(`Reading TXT: ${input}`);
+            const text = await fs.readFile(input, 'utf8');
+            return await parseTextSource(text, input, client, options);
+        }
+
+        throw new Error('Only CSV, TXT, and supported JSON files are supported for file input.');
     }
 
     const playlistMatch = input.match(/\/playlist\/([^/?#]+)/i);
@@ -1160,7 +1167,7 @@ async function resolveSource(input, client, options = {}) {
         };
     }
 
-    throw new Error('Unsupported input. Use a CSV/JSON file or a Monochrome album, track, artist, or playlist link.');
+    throw new Error('Unsupported input. Use a CSV/TXT/JSON file or a Monochrome album, track, artist, or playlist link.');
 }
 
 async function parseCsvSource(csvText, client) {
@@ -1205,6 +1212,69 @@ async function parseCsvSource(csvText, client) {
     }
 
     return { tracks, missing };
+}
+
+async function parseTextSource(text, filePath, client, options = {}) {
+    const lines = text
+        .replace(/^\uFEFF/u, '')
+        .split(/\r?\n/u)
+        .map((line) => line.trim())
+        .filter((line) => line && !line.startsWith('#'));
+
+    if (!lines.length) {
+        return {
+            type: 'txt',
+            title: path.basename(filePath, path.extname(filePath)),
+            tracks: [],
+            missing: [],
+            metadata: {
+                title: path.basename(filePath, path.extname(filePath)),
+                source: filePath,
+                lineCount: 0,
+            },
+        };
+    }
+
+    const tracks = [];
+    const missing = [];
+    console.log(`TXT entries to resolve: ${lines.length}`);
+
+    for (let index = 0; index < lines.length; index += 1) {
+        const entry = lines[index];
+        console.log(`[resolve ${index + 1}/${lines.length}] ${entry}`);
+
+        try {
+            const resolved = await resolveSource(entry, client, options);
+            tracks.push(...(resolved.tracks || []));
+            if (Array.isArray(resolved.missing) && resolved.missing.length) {
+                missing.push(
+                    ...resolved.missing.map((item) => ({
+                        ...item,
+                        source: entry,
+                    }))
+                );
+            }
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            console.log(`  -> skipped: ${message}`);
+            missing.push({
+                source: entry,
+                reason: message,
+            });
+        }
+    }
+
+    return {
+        type: 'txt',
+        title: path.basename(filePath, path.extname(filePath)),
+        tracks: dedupeTracksById(tracks),
+        missing,
+        metadata: {
+            title: path.basename(filePath, path.extname(filePath)),
+            source: filePath,
+            lineCount: lines.length,
+        },
+    };
 }
 
 async function parseJsonSource(jsonText, filePath, client, options = {}) {
