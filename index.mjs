@@ -104,6 +104,9 @@ async function main() {
     const source = await resolveSource(sourceValue, client, {
         skipPlaybackPreflight,
     });
+    if (source.type === 'track' && source.metadata) {
+        source.metadata = await hydrateTrackAlbumMetadata(source.metadata, client).catch(() => source.metadata);
+    }
     await cache.flush();
     await fs.mkdir(outputRoot, { recursive: true });
 
