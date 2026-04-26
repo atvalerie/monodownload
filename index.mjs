@@ -152,8 +152,10 @@ async function main() {
     currentRunState = new RunState(assemblyRoot, source, downloaded, failures);
     await currentRunState.flush();
 
-    if (recoveredState.downloaded.length > 0) {
-        console.log(`Recovered ${recoveredState.downloaded.length} completed track(s) from existing run state.`);
+    if (recoveredState.downloadedIds.size > 0) {
+        console.log(
+            `Run state: skipped ${recoveredState.downloadedIds.size} track(s) from downloadedIds, rehydrated ${recoveredState.downloaded.length} track(s) with file paths.`
+        );
     }
 
     let queue = source.tracks
@@ -2771,13 +2773,13 @@ async function recoverDownloadedState(rootDir, source) {
     );
 
     const downloaded = [];
-    const downloadedIds = new Set();
+    const downloadedIds = new Set(candidateIds);
 
     for (const id of candidateIds) {
         const sourceTrack = sourceTracksById.get(id);
         const persistedTrack = persistedTrackRecords.get(id);
         const relativeFilePath = String(persistedTrack?.filePath || '').trim();
-        if (!sourceTrack) {
+        if (!sourceTrack || !relativeFilePath) {
             continue;
         }
 
@@ -2793,9 +2795,8 @@ async function recoverDownloadedState(rootDir, source) {
             duration: sourceTrack?.duration ?? persistedTrack?.duration ?? null,
             trackNumber: sourceTrack?.trackNumber ?? persistedTrack?.trackNumber ?? null,
             isrc: sourceTrack?.isrc ?? persistedTrack?.isrc ?? null,
-            filePath: relativeFilePath || sourceTrack?.filePath || null,
+            filePath: relativeFilePath,
         });
-        downloadedIds.add(id);
     }
 
     const failures = (Array.isArray(runState?.failures) ? runState.failures : []).filter(
