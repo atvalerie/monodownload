@@ -161,6 +161,7 @@ async function main() {
     let queue = source.tracks
         .filter((track) => !recoveredState.downloadedIds.has(normalizeId(track?.id)))
         .map((track) => ({ track, retryCount: 0 }));
+    const pendingTrackCount = queue.length;
 
     while (queue.length > 0) {
         const nextQueue = [];
@@ -175,7 +176,7 @@ async function main() {
             const trackLabel =
                 retryCount > 0
                     ? `[retry ${retryCount}/${downloadRetries}] ${displayTitle}`
-                    : `[${index + 1}/${source.tracks.length}] ${displayTitle}`;
+                    : `[${index + 1}/${pendingTrackCount} remaining | ${recoveredState.downloadedIds.size + index + 1}/${source.tracks.length} total] ${displayTitle}`;
             console.log(trackLabel);
 
             try {
