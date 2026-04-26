@@ -145,13 +145,20 @@ async function main() {
         }
     }
 
-    const downloaded = [];
-    const failures = [];
+    const recoveredState = await recoverDownloadedState(assemblyRoot, source);
+    const downloaded = [...recoveredState.downloaded];
+    const failures = [...recoveredState.failures];
     const albumCoverWrites = new Set();
     currentRunState = new RunState(assemblyRoot, source, downloaded, failures);
     await currentRunState.flush();
 
-    let queue = source.tracks.map((track) => ({ track, retryCount: 0 }));
+    if (recoveredState.downloaded.length > 0) {
+        console.log(`Recovered ${recoveredState.downloaded.length} completed track(s) from existing run state.`);
+    }
+
+    let queue = source.tracks
+        .filter((track) => !recoveredState.downloadedIds.has(normalizeId(track?.id)))
+        .map((track) => ({ track, retryCount: 0 }));
 
     while (queue.length > 0) {
         const nextQueue = [];
@@ -179,6 +186,7 @@ async function main() {
                     flatAlbumDir,
                     albumOnlyFolder,
                 });
+                removeFailureByTrackId(failures, downloadedTrack.id);
                 downloaded.push(downloadedTrack);
                 await currentRunState.flush();
             } catch (error) {
@@ -191,13 +199,13 @@ async function main() {
                         retryCount: retryCount + 1,
                     });
                 } else {
-                    failures.push({
+                    upsertFailure(failures, {
                         id: track.id,
                         title: getTrackTitle(track),
                         artist: getTrackArtists(track),
                         error: message,
                     });
-                    console.warn(`  Failed: ${failures.at(-1).error}`);
+                    console.warn(`  Failed: ${message}`);
                 }
 
                 await currentRunState.flush();
@@ -1021,6 +1029,7 @@ class RunState {
                     downloadedCount: this.downloaded.length,
                     failureCount: this.failures.length,
                     downloadedIds: this.downloaded.map((track) => track.id),
+                    downloadedTracks: this.downloaded.map((track) => toPersistedTrackRecord(track)),
                     failures: this.failures,
                 },
                 null,
@@ -1602,6 +1611,21 @@ function normalizeId(value) {
     return String(value);
 }
 
+function toPersistedTrackRecord(track) {
+    return {
+        id: normalizeId(track?.id),
+        title: getTrackTitle(track),
+        artist: getTrackArtists(track),
+        album: track?.album?.title || null,
+        albumId: normalizeId(track?.album?.id || track?.albumId),
+        albumArtist: getAlbumArtist(track),
+        trackNumber: track?.trackNumber ?? null,
+        duration: Math.round(track?.duration || 0),
+        isrc: track?.isrc ?? null,
+        filePath: track?.filePath || null,
+    };
+}
+
 async function resolveTrackAlbumId(track, trackId, client) {
     const directAlbumId = normalizeId(track?.albumId || track?.album?.id);
     if (directAlbumId) {
@@ -1821,11 +1845,11 @@ async function downloadTrack({ track, assemblyRoot, client, includeLyrics, album
 
     const absoluteAudioPath = path.join(albumDir, `${fileBase}.flac`);
 
-    const existingAudioPath = await findExistingAudioPath(absoluteAudioPath);
-    if (existingAudioPath) {
+    const existingAudio = await inspectExistingAudioPath(absoluteAudioPath, resolvedTrack.duration);
+    if (existingAudio.usablePath) {
         const finalRelativeAudioPath = flatAlbumDir
-            ? path.relative(assemblyRoot, existingAudioPath).split(path.sep).join(path.posix.sep)
-            : path.posix.join(path.basename(albumDir), path.basename(existingAudioPath));
+            ? path.relative(assemblyRoot, existingAudio.usablePath).split(path.sep).join(path.posix.sep)
+            : path.posix.join(path.basename(albumDir), path.basename(existingAudio.usablePath));
         console.log(`  -> file exists, skipping download: ${finalRelativeAudioPath}`);
         return {
             ...resolvedTrack,
@@ -1833,17 +1857,28 @@ async function downloadTrack({ track, assemblyRoot, client, includeLyrics, album
         };
     }
 
-    const audioResult = await client.downloadTrackToFile(resolvedTrack.id, absoluteAudioPath);
-    const finalRelativeAudioPath = flatAlbumDir
-        ? relativeAudioPath.replace(/\.flac$/i, `.${audioResult.extension}`)
-        : path.posix.join(path.basename(albumDir), `${fileBase}.${audioResult.extension}`);
-    let finalAbsoluteAudioPath = absoluteAudioPath;
+    let downloadAudioPath = absoluteAudioPath;
+    if (existingAudio.blockedPaths.has(absoluteAudioPath)) {
+        downloadAudioPath = await findAvailableSiblingPath(absoluteAudioPath, 'redownload');
+        console.warn(`  -> keeping invalid existing file, redownloading to: ${path.basename(downloadAudioPath)}`);
+    }
+
+    const audioResult = await client.downloadTrackToFile(resolvedTrack.id, downloadAudioPath);
+    let finalAbsoluteAudioPath = downloadAudioPath;
 
     if (audioResult.extension !== 'flac') {
-        finalAbsoluteAudioPath = absoluteAudioPath.replace(/\.flac$/i, `.${audioResult.extension}`);
-        await fs.rename(absoluteAudioPath, finalAbsoluteAudioPath);
+        let extensionTargetPath = downloadAudioPath.replace(/\.flac$/i, `.${audioResult.extension}`);
+        if (existingAudio.blockedPaths.has(extensionTargetPath) || (await exists(extensionTargetPath))) {
+            extensionTargetPath = await findAvailableSiblingPath(extensionTargetPath, 'redownload');
+        }
+        finalAbsoluteAudioPath = extensionTargetPath;
+        await fs.rename(downloadAudioPath, finalAbsoluteAudioPath);
         console.warn(`  Saved ${resolvedTrack.id} as .${audioResult.extension} because the upstream stream was not FLAC.`);
     }
+
+    const finalRelativeAudioPath = flatAlbumDir
+        ? path.relative(assemblyRoot, finalAbsoluteAudioPath).split(path.sep).join(path.posix.sep)
+        : path.posix.join(path.basename(albumDir), path.basename(finalAbsoluteAudioPath));
 
     let embeddedLyrics = null;
     if (includeLyrics) {
@@ -2684,7 +2719,7 @@ async function exists(target) {
     }
 }
 
-async function findExistingAudioPath(flacPath) {
+async function inspectExistingAudioPath(flacPath, expectedDurationSeconds = null) {
     const parsed = path.parse(flacPath);
     const candidates = [
         flacPath,
@@ -2692,14 +2727,188 @@ async function findExistingAudioPath(flacPath) {
         path.join(parsed.dir, `${parsed.name}.mp3`),
         path.join(parsed.dir, `${parsed.name}.mp4`),
     ];
+    const blockedPaths = new Set();
 
     for (const candidate of candidates) {
         if (await exists(candidate)) {
-            return candidate;
+            if (await isUsableExistingAudioFile(candidate, expectedDurationSeconds)) {
+                return {
+                    usablePath: candidate,
+                    blockedPaths,
+                };
+            }
+            blockedPaths.add(candidate);
+            console.warn(`  -> existing file looks invalid, leaving it in place: ${path.basename(candidate)}`);
         }
     }
 
-    return null;
+    return {
+        usablePath: null,
+        blockedPaths,
+    };
+}
+
+async function isUsableExistingAudioFile(filePath, expectedDurationSeconds = null) {
+    let stats;
+    try {
+        stats = await fs.stat(filePath);
+    } catch {
+        return false;
+    }
+
+    if (!stats.isFile() || stats.size <= 0) {
+        return false;
+    }
+
+    const probe = await probeMedia(filePath).catch(() => null);
+    if (!probe) {
+        return false;
+    }
+
+    const audioStreams = Array.isArray(probe.streams)
+        ? probe.streams.filter((stream) => stream?.codec_type === 'audio')
+        : [];
+    if (audioStreams.length === 0) {
+        return false;
+    }
+
+    if (expectedDurationSeconds && Number(expectedDurationSeconds) > 0) {
+        const probedDuration = Number(probe?.format?.duration || audioStreams[0]?.duration || 0);
+        if (probedDuration > 0 && probedDuration + 2 < Number(expectedDurationSeconds) * 0.85) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+async function findAvailableSiblingPath(filePath, suffix) {
+    const parsed = path.parse(filePath);
+    let candidate = path.join(parsed.dir, `${parsed.name} (${suffix})${parsed.ext}`);
+    let attempt = 2;
+
+    while (await exists(candidate)) {
+        candidate = path.join(parsed.dir, `${parsed.name} (${suffix} ${attempt})${parsed.ext}`);
+        attempt += 1;
+    }
+
+    return candidate;
+}
+
+async function readJsonIfExists(filePath) {
+    try {
+        const content = await fs.readFile(filePath, 'utf8');
+        return JSON.parse(content);
+    } catch {
+        return null;
+    }
+}
+
+async function recoverDownloadedState(rootDir, source) {
+    const runStatePath = path.join(rootDir, '_run-state.json');
+    const collectionJsonPath = path.join(rootDir, `${sanitizeForFilename(source.title)}.json`);
+    const runState = await readJsonIfExists(runStatePath);
+    const collection = await readJsonIfExists(collectionJsonPath);
+    const sourceTracksById = new Map(
+        source.tracks
+            .map((track) => [normalizeId(track?.id), track])
+            .filter(([id]) => Boolean(id))
+    );
+    const persistedTrackRecords = new Map();
+
+    for (const track of Array.isArray(collection?.tracks) ? collection.tracks : []) {
+        const id = normalizeId(track?.id);
+        if (id) {
+            persistedTrackRecords.set(id, track);
+        }
+    }
+
+    for (const track of Array.isArray(runState?.downloadedTracks) ? runState.downloadedTracks : []) {
+        const id = normalizeId(track?.id);
+        if (id) {
+            persistedTrackRecords.set(id, track);
+        }
+    }
+
+    const candidateIds = new Set(
+        [
+            ...(Array.isArray(runState?.downloadedIds) ? runState.downloadedIds : []),
+            ...persistedTrackRecords.keys(),
+        ]
+            .map((id) => normalizeId(id))
+            .filter(Boolean)
+    );
+
+    const downloaded = [];
+    const downloadedIds = new Set();
+
+    for (const id of candidateIds) {
+        const sourceTrack = sourceTracksById.get(id);
+        const persistedTrack = persistedTrackRecords.get(id);
+        const relativeFilePath = String(persistedTrack?.filePath || '').trim();
+        if (!sourceTrack || !relativeFilePath) {
+            continue;
+        }
+
+        const absoluteFilePath = path.join(rootDir, ...relativeFilePath.split('/'));
+        if (!(await isUsableExistingAudioFile(absoluteFilePath, sourceTrack?.duration ?? persistedTrack?.duration ?? null))) {
+            continue;
+        }
+
+        downloaded.push({
+            ...sourceTrack,
+            album: sourceTrack?.album || (persistedTrack?.album || persistedTrack?.albumId || persistedTrack?.albumArtist
+                ? {
+                      id: persistedTrack?.albumId || null,
+                      title: persistedTrack?.album || null,
+                      artist: persistedTrack?.albumArtist ? { id: null, name: persistedTrack.albumArtist } : null,
+                  }
+                : undefined),
+            duration: sourceTrack?.duration ?? persistedTrack?.duration ?? null,
+            trackNumber: sourceTrack?.trackNumber ?? persistedTrack?.trackNumber ?? null,
+            isrc: sourceTrack?.isrc ?? persistedTrack?.isrc ?? null,
+            filePath: relativeFilePath,
+        });
+        downloadedIds.add(id);
+    }
+
+    const failures = (Array.isArray(runState?.failures) ? runState.failures : []).filter(
+        (failure) => !downloadedIds.has(normalizeId(failure?.id))
+    );
+
+    return {
+        downloaded,
+        downloadedIds,
+        failures,
+    };
+}
+
+function upsertFailure(failures, failure) {
+    const id = normalizeId(failure?.id);
+    if (!id) {
+        failures.push(failure);
+        return;
+    }
+
+    const existingIndex = failures.findIndex((entry) => normalizeId(entry?.id) === id);
+    if (existingIndex >= 0) {
+        failures[existingIndex] = failure;
+        return;
+    }
+
+    failures.push(failure);
+}
+
+function removeFailureByTrackId(failures, trackId) {
+    const id = normalizeId(trackId);
+    if (!id) {
+        return;
+    }
+
+    const index = failures.findIndex((entry) => normalizeId(entry?.id) === id);
+    if (index >= 0) {
+        failures.splice(index, 1);
+    }
 }
 
 function normalizeEquivalentPathSegment(value) {
