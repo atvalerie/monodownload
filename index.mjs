@@ -1845,11 +1845,11 @@ async function downloadTrack({ track, assemblyRoot, client, includeLyrics, album
 
     const absoluteAudioPath = path.join(albumDir, `${fileBase}.flac`);
 
-    const existingAudio = await inspectExistingAudioPath(absoluteAudioPath, resolvedTrack.duration);
-    if (existingAudio.usablePath) {
+    const existingAudioPath = await findExistingAudioPath(absoluteAudioPath);
+    if (existingAudioPath) {
         const finalRelativeAudioPath = flatAlbumDir
-            ? path.relative(assemblyRoot, existingAudio.usablePath).split(path.sep).join(path.posix.sep)
-            : path.posix.join(path.basename(albumDir), path.basename(existingAudio.usablePath));
+            ? path.relative(assemblyRoot, existingAudioPath).split(path.sep).join(path.posix.sep)
+            : path.posix.join(path.basename(albumDir), path.basename(existingAudioPath));
         console.log(`  -> file exists, skipping download: ${finalRelativeAudioPath}`);
         return {
             ...resolvedTrack,
@@ -1857,22 +1857,12 @@ async function downloadTrack({ track, assemblyRoot, client, includeLyrics, album
         };
     }
 
-    let downloadAudioPath = absoluteAudioPath;
-    if (existingAudio.blockedPaths.has(absoluteAudioPath)) {
-        downloadAudioPath = await findAvailableSiblingPath(absoluteAudioPath, 'redownload');
-        console.warn(`  -> keeping invalid existing file, redownloading to: ${path.basename(downloadAudioPath)}`);
-    }
-
-    const audioResult = await client.downloadTrackToFile(resolvedTrack.id, downloadAudioPath);
-    let finalAbsoluteAudioPath = downloadAudioPath;
+    const audioResult = await client.downloadTrackToFile(resolvedTrack.id, absoluteAudioPath);
+    let finalAbsoluteAudioPath = absoluteAudioPath;
 
     if (audioResult.extension !== 'flac') {
-        let extensionTargetPath = downloadAudioPath.replace(/\.flac$/i, `.${audioResult.extension}`);
-        if (existingAudio.blockedPaths.has(extensionTargetPath) || (await exists(extensionTargetPath))) {
-            extensionTargetPath = await findAvailableSiblingPath(extensionTargetPath, 'redownload');
-        }
-        finalAbsoluteAudioPath = extensionTargetPath;
-        await fs.rename(downloadAudioPath, finalAbsoluteAudioPath);
+        finalAbsoluteAudioPath = absoluteAudioPath.replace(/\.flac$/i, `.${audioResult.extension}`);
+        await fs.rename(absoluteAudioPath, finalAbsoluteAudioPath);
         console.warn(`  Saved ${resolvedTrack.id} as .${audioResult.extension} because the upstream stream was not FLAC.`);
     }
 
@@ -2719,7 +2709,7 @@ async function exists(target) {
     }
 }
 
-async function inspectExistingAudioPath(flacPath, expectedDurationSeconds = null) {
+async function findExistingAudioPath(flacPath) {
     const parsed = path.parse(flacPath);
     const candidates = [
         flacPath,
@@ -2727,72 +2717,13 @@ async function inspectExistingAudioPath(flacPath, expectedDurationSeconds = null
         path.join(parsed.dir, `${parsed.name}.mp3`),
         path.join(parsed.dir, `${parsed.name}.mp4`),
     ];
-    const blockedPaths = new Set();
-
     for (const candidate of candidates) {
         if (await exists(candidate)) {
-            if (await isUsableExistingAudioFile(candidate, expectedDurationSeconds)) {
-                return {
-                    usablePath: candidate,
-                    blockedPaths,
-                };
-            }
-            blockedPaths.add(candidate);
-            console.warn(`  -> existing file looks invalid, leaving it in place: ${path.basename(candidate)}`);
+            return candidate;
         }
     }
 
-    return {
-        usablePath: null,
-        blockedPaths,
-    };
-}
-
-async function isUsableExistingAudioFile(filePath, expectedDurationSeconds = null) {
-    let stats;
-    try {
-        stats = await fs.stat(filePath);
-    } catch {
-        return false;
-    }
-
-    if (!stats.isFile() || stats.size <= 0) {
-        return false;
-    }
-
-    const probe = await probeMedia(filePath).catch(() => null);
-    if (!probe) {
-        return false;
-    }
-
-    const audioStreams = Array.isArray(probe.streams)
-        ? probe.streams.filter((stream) => stream?.codec_type === 'audio')
-        : [];
-    if (audioStreams.length === 0) {
-        return false;
-    }
-
-    if (expectedDurationSeconds && Number(expectedDurationSeconds) > 0) {
-        const probedDuration = Number(probe?.format?.duration || audioStreams[0]?.duration || 0);
-        if (probedDuration > 0 && probedDuration + 2 < Number(expectedDurationSeconds) * 0.85) {
-            return false;
-        }
-    }
-
-    return true;
-}
-
-async function findAvailableSiblingPath(filePath, suffix) {
-    const parsed = path.parse(filePath);
-    let candidate = path.join(parsed.dir, `${parsed.name} (${suffix})${parsed.ext}`);
-    let attempt = 2;
-
-    while (await exists(candidate)) {
-        candidate = path.join(parsed.dir, `${parsed.name} (${suffix} ${attempt})${parsed.ext}`);
-        attempt += 1;
-    }
-
-    return candidate;
+    return null;
 }
 
 async function readJsonIfExists(filePath) {
@@ -2846,12 +2777,7 @@ async function recoverDownloadedState(rootDir, source) {
         const sourceTrack = sourceTracksById.get(id);
         const persistedTrack = persistedTrackRecords.get(id);
         const relativeFilePath = String(persistedTrack?.filePath || '').trim();
-        if (!sourceTrack || !relativeFilePath) {
-            continue;
-        }
-
-        const absoluteFilePath = path.join(rootDir, ...relativeFilePath.split('/'));
-        if (!(await isUsableExistingAudioFile(absoluteFilePath, sourceTrack?.duration ?? persistedTrack?.duration ?? null))) {
+        if (!sourceTrack) {
             continue;
         }
 
@@ -2867,7 +2793,7 @@ async function recoverDownloadedState(rootDir, source) {
             duration: sourceTrack?.duration ?? persistedTrack?.duration ?? null,
             trackNumber: sourceTrack?.trackNumber ?? persistedTrack?.trackNumber ?? null,
             isrc: sourceTrack?.isrc ?? persistedTrack?.isrc ?? null,
-            filePath: relativeFilePath,
+            filePath: relativeFilePath || sourceTrack?.filePath || null,
         });
         downloadedIds.add(id);
     }
