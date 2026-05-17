@@ -21,7 +21,7 @@ It keeps the working resolver behavior from the fork:
 
 ## Requirements
 
-- Node.js 20+
+- bun
 - `ffmpeg` and `ffprobe` available on `PATH`
 
 ## Usage
@@ -29,13 +29,13 @@ It keeps the working resolver behavior from the fork:
 From this folder:
 
 ```powershell
-npm run download -- --input "C:\Users\v\Downloads\liked.csv" --output "C:\Users\v\Music"
+bun run download -- --input "C:\Users\v\Downloads\liked.csv" --output "C:\Users\v\Music"
 ```
 
 Or directly:
 
 ```powershell
-node .\index.mjs --input "C:\Users\v\Downloads\liked.csv" --output "C:\Users\v\Music"
+bun .\index.mjs --input "C:\Users\v\Downloads\liked.csv" --output "C:\Users\v\Music"
 ```
 
 ## Options
