@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
@@ -1048,7 +1048,7 @@ function printHelp() {
 Monochrome playlist downloader
 
 Usage:
-  node index.mjs --input <csv-json-or-link> [--output <dir>]
+  bun index.mjs --input <csv-json-or-link> [--output <dir>]
 
 Accepted input:
   - Spotify playlist/library CSV exports with track and artist columns
